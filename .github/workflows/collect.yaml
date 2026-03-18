@@ -64,13 +64,13 @@ jobs:
               exit 1
           fi
 
-      - name: Inject Extra Subscribes
+      - name: Inject Extra Inputs
         env:
           EXTRA_GIST_LINK: ${{ secrets.EXTRA_GIST_LINK }}
           EXTRA_GIST_PAT: ${{ secrets.EXTRA_GIST_PAT }}
         run: |
           if [ -z "$EXTRA_GIST_LINK" ] || [ -z "$EXTRA_GIST_PAT" ]; then
-              echo "Skip extra subscribes injection because EXTRA_GIST_LINK or EXTRA_GIST_PAT is empty"
+              echo "Skip extra input injection because EXTRA_GIST_LINK or EXTRA_GIST_PAT is empty"
               exit 0
           fi
 
@@ -90,6 +90,33 @@ jobs:
               elif "/" in value:
                   value = value.split("/", maxsplit=1)[1].strip()
               return value
+
+          def read_url(url: str, headers: dict | None = None) -> str:
+              request = urllib.request.Request(url=url, headers=headers or {"User-Agent": "aggregator-actions"})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return response.read().decode("utf-8")
+
+          def read_gist_file(files: dict, filename: str, headers: dict) -> str:
+              target = files.get(filename)
+              if not target:
+                  return ""
+              content = target.get("content", "")
+              if target.get("truncated"):
+                  content = read_url(target["raw_url"], headers=headers)
+              return content
+
+          def merge_contents(*contents: str) -> list[str]:
+              merged = []
+              seen = set()
+              for content in contents:
+                  if not content:
+                      continue
+                  for line in content.splitlines():
+                      line = line.strip()
+                      if line and line not in seen:
+                          seen.add(line)
+                          merged.append(line)
+              return merged
 
           gist_id = normalize_gist_id(os.environ.get("EXTRA_GIST_LINK", ""))
           gist_token = (os.environ.get("EXTRA_GIST_PAT", "") or "").strip()
@@ -111,45 +138,52 @@ jobs:
           with urllib.request.urlopen(request, timeout=30) as response:
               payload = json.loads(response.read().decode("utf-8"))
 
-          target = payload.get("files", {}).get("subscribes.txt")
-          if not target:
-              raise SystemExit("Error: subscribes.txt was not found in extra gist")
+          files = payload.get("files", {})
 
-          content = target.get("content", "")
-          if target.get("truncated"):
-              raw_request = urllib.request.Request(
-                  url=target["raw_url"],
-                  headers=headers,
-              )
-              with urllib.request.urlopen(raw_request, timeout=30) as response:
-                  content = response.read().decode("utf-8")
+          subscribes_path = Path("data/subscribes.txt")
+          subscribes_path.parent.mkdir(parents=True, exist_ok=True)
+          extra_subscribes = read_gist_file(files, "subscribes.txt", headers)
+          existing_subscribes = subscribes_path.read_text(encoding="utf-8") if subscribes_path.exists() else ""
+          merged_subscribes = merge_contents(existing_subscribes, extra_subscribes)
+          if merged_subscribes:
+              with subscribes_path.open("w", encoding="utf-8", newline="\n") as handle:
+                  handle.write("\n".join(merged_subscribes) + "\n")
+              existing_count = len(merge_contents(existing_subscribes))
+              extra_count = len(merged_subscribes) - existing_count
+              print(f"Injected extra subscribes into {subscribes_path}, added {max(extra_count, 0)} line(s)")
+          else:
+              print("Skip extra subscribes injection because subscribes.txt was not found in extra gist")
 
-          path = Path("data/subscribes.txt")
-          path.parent.mkdir(parents=True, exist_ok=True)
+          base_customize = (os.environ.get("CUSTOMIZE_LINK", "") or "").strip()
+          base_customize_content = ""
+          if base_customize:
+              if re.match(r"^(https?|ftp)://", base_customize):
+                  try:
+                      base_customize_content = read_url(base_customize)
+                  except Exception as exc:
+                      print(f"Warning: failed to load existing CUSTOMIZE_LINK: {exc}")
+              else:
+                  local_customize = Path("data") / base_customize
+                  if local_customize.exists() and local_customize.is_file():
+                      base_customize_content = local_customize.read_text(encoding="utf-8")
+                  else:
+                      print(f"Warning: existing CUSTOMIZE_LINK file was not found: {local_customize}")
 
-          merged = []
-          seen = set()
+          extra_customize = read_gist_file(files, "CUSTOMIZE_LINK.txt", headers)
+          merged_customize = merge_contents(base_customize_content, extra_customize)
+          if merged_customize:
+              customize_path = Path("data/CUSTOMIZE_LINK.txt")
+              with customize_path.open("w", encoding="utf-8", newline="\n") as handle:
+                  handle.write("\n".join(merged_customize) + "\n")
 
-          if path.exists():
-              for line in path.read_text(encoding="utf-8").splitlines():
-                  line = line.strip()
-                  if line and line not in seen:
-                      seen.add(line)
-                      merged.append(line)
+              github_env = (os.environ.get("GITHUB_ENV", "") or "").strip()
+              if github_env:
+                  with open(github_env, "a", encoding="utf-8", newline="\n") as handle:
+                      handle.write("CUSTOMIZE_LINK=CUSTOMIZE_LINK.txt\n")
 
-          extra_count = 0
-          for line in content.splitlines():
-              line = line.strip()
-              if line and line not in seen:
-                  seen.add(line)
-                  merged.append(line)
-                  extra_count += 1
-
-          with path.open("w", encoding="utf-8", newline="\n") as handle:
-              if merged:
-                  handle.write("\n".join(merged) + "\n")
-
-          print(f"Injected extra subscribes into {path} , added {extra_count} line(s)")
+              print(f"Injected customize lines into {customize_path}, total {len(merged_customize)} line(s)")
+          else:
+              print("Skip extra customize injection because no customize content is available")
           PY
 
       - name: Collect
