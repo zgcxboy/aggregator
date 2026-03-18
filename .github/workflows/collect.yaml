@@ -64,6 +64,94 @@ jobs:
               exit 1
           fi
 
+      - name: Inject Extra Subscribes
+        env:
+          EXTRA_GIST_LINK: ${{ secrets.EXTRA_GIST_LINK }}
+          EXTRA_GIST_PAT: ${{ secrets.EXTRA_GIST_PAT }}
+        run: |
+          if [ -z "$EXTRA_GIST_LINK" ] || [ -z "$EXTRA_GIST_PAT" ]; then
+              echo "Skip extra subscribes injection because EXTRA_GIST_LINK or EXTRA_GIST_PAT is empty"
+              exit 0
+          fi
+
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+          from pathlib import Path
+
+          def normalize_gist_id(value: str) -> str:
+              value = (value or "").strip()
+              if not value:
+                  return ""
+              if value.startswith("https://gist.github.com/"):
+                  value = value.rstrip("/").split("/")[-1]
+              elif "/" in value:
+                  value = value.split("/", maxsplit=1)[1].strip()
+              return value
+
+          gist_id = normalize_gist_id(os.environ.get("EXTRA_GIST_LINK", ""))
+          gist_token = (os.environ.get("EXTRA_GIST_PAT", "") or "").strip()
+          if not gist_id or not re.fullmatch(r"[0-9a-fA-F]+", gist_id):
+              raise SystemExit("Error: EXTRA_GIST_LINK is invalid")
+          if not gist_token:
+              raise SystemExit("Error: EXTRA_GIST_PAT is empty")
+
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {gist_token}",
+              "User-Agent": "aggregator-actions",
+          }
+
+          request = urllib.request.Request(
+              url=f"https://api.github.com/gists/{gist_id}",
+              headers=headers,
+          )
+          with urllib.request.urlopen(request, timeout=30) as response:
+              payload = json.loads(response.read().decode("utf-8"))
+
+          target = payload.get("files", {}).get("subscribes.txt")
+          if not target:
+              raise SystemExit("Error: subscribes.txt was not found in extra gist")
+
+          content = target.get("content", "")
+          if target.get("truncated"):
+              raw_request = urllib.request.Request(
+                  url=target["raw_url"],
+                  headers=headers,
+              )
+              with urllib.request.urlopen(raw_request, timeout=30) as response:
+                  content = response.read().decode("utf-8")
+
+          path = Path("data/subscribes.txt")
+          path.parent.mkdir(parents=True, exist_ok=True)
+
+          merged = []
+          seen = set()
+
+          if path.exists():
+              for line in path.read_text(encoding="utf-8").splitlines():
+                  line = line.strip()
+                  if line and line not in seen:
+                      seen.add(line)
+                      merged.append(line)
+
+          extra_count = 0
+          for line in content.splitlines():
+              line = line.strip()
+              if line and line not in seen:
+                  seen.add(line)
+                  merged.append(line)
+                  extra_count += 1
+
+          with path.open("w", encoding="utf-8", newline="\n") as handle:
+              if merged:
+                  handle.write("\n".join(merged) + "\n")
+
+          print(f"Injected extra subscribes into {path} , added {extra_count} line(s)")
+          PY
+
       - name: Collect
         run: python -u subscribe/collect.py --all --overwrite --skip
 
